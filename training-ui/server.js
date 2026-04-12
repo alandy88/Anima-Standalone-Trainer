@@ -13,7 +13,7 @@ const os = require('os');
     try {
         execSync('python -c "import cuda_direct_backend"', { stdio: 'ignore' });
     } catch {
-        const pkgPath = path.join(__dirname, '..', 'cuda_direct_backend');
+        const pkgPath = path.join(__dirname, '..', 'cuda_direct_pkg');
         if (fs.existsSync(pkgPath)) {
             console.log('[setup] Installing cuda_direct_backend...');
             try {
