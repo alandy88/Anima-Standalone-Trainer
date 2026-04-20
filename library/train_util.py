@@ -4038,6 +4038,14 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="(Windows multi-GPU only) use cuda_direct backend for GPU-to-GPU transfers instead of Gloo."
              " Requires cuda_direct_backend to be installed. Ignored on Linux.",
     )
+    parser.add_argument("--megatron_tp_degree", type=int, default=1, help="Megatron-LM tensor parallelism degree.")
+    parser.add_argument("--megatron_pp_degree", type=int, default=1, help="Megatron-LM pipeline parallelism degree.")
+    parser.add_argument("--megatron_num_micro_batches", type=int, default=1, help="Megatron-LM micro-batches per global batch (1F1B pipeline schedule).")
+    parser.add_argument("--megatron_gradient_clipping", type=float, default=1.0, help="Megatron-LM gradient clipping (global L2 norm, 0 to disable).")
+    parser.add_argument("--megatron_sequence_parallel", action="store_true", help="Megatron-LM sequence parallelism — splits activation memory along the sequence dimension across TP ranks. Requires TP > 1.")
+    parser.add_argument("--megatron_recompute_activations", action="store_true", help="Megatron-LM selective activation recomputation.")
+    parser.add_argument("--megatron_distributed_optimizer", action="store_true", help="Megatron-LM distributed optimizer (ZeRO-1 style optimizer state sharding).")
+    parser.add_argument("--megatron_vpp_layers", type=int, default=None, help="Megatron-LM layers per virtual pipeline stage (interleaved schedule, PP > 1 only).")
     parser.add_argument(
         "--clip_skip",
         type=int,
@@ -5559,6 +5567,26 @@ def prepare_accelerator(args: argparse.Namespace):
     kwargs_handlers = [i for i in kwargs_handlers if i is not None]
     deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
 
+    megatron_lm_plugin = None
+    _megatron_active = (
+        getattr(args, "megatron_tp_degree", 1) > 1
+        or getattr(args, "megatron_pp_degree", 1) > 1
+        or getattr(args, "megatron_recompute_activations", False)
+        or getattr(args, "megatron_distributed_optimizer", False)
+    )
+    if _megatron_active:
+        from accelerate.utils import MegatronLMPlugin
+        megatron_lm_plugin = MegatronLMPlugin(
+            tp_degree=getattr(args, "megatron_tp_degree", 1),
+            pp_degree=getattr(args, "megatron_pp_degree", 1),
+            num_micro_batches=getattr(args, "megatron_num_micro_batches", 1),
+            gradient_clipping=getattr(args, "megatron_gradient_clipping", 1.0),
+            sequence_parallelism=getattr(args, "megatron_sequence_parallel", False),
+            recompute_activations=getattr(args, "megatron_recompute_activations", False),
+            use_distributed_optimizer=getattr(args, "megatron_distributed_optimizer", False),
+            num_layers_per_virtual_pipeline_stage=getattr(args, "megatron_vpp_layers", None),
+        )
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -5567,6 +5595,7 @@ def prepare_accelerator(args: argparse.Namespace):
         kwargs_handlers=kwargs_handlers,
         dynamo_backend=dynamo_backend,
         deepspeed_plugin=deepspeed_plugin,
+        megatron_lm_plugin=megatron_lm_plugin,
     )
     print("accelerator device:", accelerator.device)
     return accelerator

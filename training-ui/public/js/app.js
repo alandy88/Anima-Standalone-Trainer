@@ -470,6 +470,15 @@ function populateConfig(config) {
   $("cfg-step-profile").checked = t.step_profile ?? false;
   $("cfg-profile-microbatch").checked = t.profile_microbatch ?? false;
   $("cfg-profile-microbatch-group").style.display = (t.step_profile ?? false) ? "" : "none";
+  // Megatron-LM
+  $("cfg-megatron-tp-degree").value = t.megatron_tp_degree ?? 1;
+  $("cfg-megatron-pp-degree").value = t.megatron_pp_degree ?? 1;
+  $("cfg-megatron-num-micro-batches").value = t.megatron_num_micro_batches ?? 1;
+  $("cfg-megatron-gradient-clipping").value = t.megatron_gradient_clipping ?? 1.0;
+  $("cfg-megatron-sequence-parallel").checked = t.megatron_sequence_parallel ?? false;
+  $("cfg-megatron-recompute-activations").checked = t.megatron_recompute_activations ?? false;
+  $("cfg-megatron-distributed-optimizer").checked = t.megatron_distributed_optimizer ?? false;
+  $("cfg-megatron-vpp-layers").value = t.megatron_vpp_layers || "";
   // Check GPU boxes based on config
   const savedIds = (config.gpu_ids || "")
     .split(",")
@@ -727,6 +736,15 @@ function gatherConfig() {
       fsdp2_auto_wrap_policy: $("cfg-fsdp2-auto-wrap-policy").value,
       fsdp2_min_num_params: safeInt($("cfg-fsdp2-min-num-params").value),
       fsdp2_transformer_layer_cls_to_wrap: $("cfg-fsdp2-layer-to-wrap").value.trim(),
+      // Megatron-LM
+      megatron_tp_degree: safeInt($("cfg-megatron-tp-degree").value) || 1,
+      megatron_pp_degree: safeInt($("cfg-megatron-pp-degree").value) || 1,
+      megatron_num_micro_batches: safeInt($("cfg-megatron-num-micro-batches").value) || 1,
+      megatron_gradient_clipping: safeFloat($("cfg-megatron-gradient-clipping").value) ?? 1.0,
+      megatron_sequence_parallel: $("cfg-megatron-sequence-parallel").checked,
+      megatron_recompute_activations: $("cfg-megatron-recompute-activations").checked,
+      megatron_distributed_optimizer: $("cfg-megatron-distributed-optimizer").checked,
+      ...($("cfg-megatron-vpp-layers").value ? { megatron_vpp_layers: safeInt($("cfg-megatron-vpp-layers").value) } : {}),
       // Diagnostics
       step_profile: $("cfg-step-profile").checked,
       profile_microbatch: $("cfg-profile-microbatch").checked,
@@ -2595,16 +2613,22 @@ async function loadGPUs() {
 // Show the correct mode panel, hide the others.
 // Panels use only the "hidden" class for visibility — no disabled-section.
 function applyMultiGpuMode(mode) {
-  const ddpGroup   = $("group-ddp-opts");
-  const fsdpGroup  = $("group-fsdp");
-  const fsdp2Group = $("group-fsdp2");
-  const tpGroup    = $("group-tp-sp");
+  const ddpGroup      = $("group-ddp-opts");
+  const fsdpGroup     = $("group-fsdp");
+  const fsdp2Group    = $("group-fsdp2");
+  const tpGroup       = $("group-tp-sp");
+  const megatronGroup = $("group-megatron");
+  const cudaGroup     = $("group-cuda-direct");
   if (!ddpGroup || !fsdpGroup || !tpGroup) return;
 
-  ddpGroup.classList.toggle("hidden",   mode !== "ddp");
-  fsdpGroup.classList.toggle("hidden",  mode !== "fsdp");
+  ddpGroup.classList.toggle("hidden",      mode !== "ddp");
+  fsdpGroup.classList.toggle("hidden",     mode !== "fsdp");
   if (fsdp2Group) fsdp2Group.classList.toggle("hidden", mode !== "fsdp2");
-  tpGroup.classList.toggle("hidden",    mode !== "tp_sp");
+  tpGroup.classList.toggle("hidden",       mode !== "tp_sp");
+  if (megatronGroup) megatronGroup.classList.toggle("hidden", mode !== "megatron_lm");
+
+  // Hide CUDA Direct when Megatron-LM is selected — incompatible
+  if (cudaGroup) cudaGroup.classList.toggle("hidden", mode === "megatron_lm");
 
   // Keep hidden checkbox in sync so reconcileFSDPConflicts still works
   const fsdpToggle = $("cfg-use-fsdp");
@@ -2632,7 +2656,7 @@ function updateMultiGPUUI() {
     if (modeGroup) modeGroup.classList.add("disabled-section");
     cudaGroup.classList.add("disabled-section");
     cudaToggle.checked = false;
-    ["group-ddp-opts", "group-fsdp", "group-fsdp2", "group-tp-sp"].forEach(id => {
+    ["group-ddp-opts", "group-fsdp", "group-fsdp2", "group-tp-sp", "group-megatron"].forEach(id => {
       const el = $(id);
       if (el) el.classList.add("hidden");
     });

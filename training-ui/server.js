@@ -1011,6 +1011,25 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                     }
                 }
 
+            } else if (mode === 'megatron_lm') {
+                accelerateFlags = `--use_megatron_lm --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
+                if (ta.megatron_tp_degree && ta.megatron_tp_degree > 1)
+                    accelerateFlags += ` --megatron_lm_tp_degree ${ta.megatron_tp_degree}`;
+                if (ta.megatron_pp_degree && ta.megatron_pp_degree > 1)
+                    accelerateFlags += ` --megatron_lm_pp_degree ${ta.megatron_pp_degree}`;
+                if (ta.megatron_num_micro_batches && ta.megatron_num_micro_batches > 1)
+                    accelerateFlags += ` --megatron_lm_num_micro_batches ${ta.megatron_num_micro_batches}`;
+                if (ta.megatron_recompute_activations)
+                    accelerateFlags += ` --megatron_lm_recompute_activations true`;
+                if (ta.megatron_sequence_parallel)
+                    accelerateFlags += ` --megatron_lm_sequence_parallelism true`;
+                if (ta.megatron_distributed_optimizer)
+                    accelerateFlags += ` --megatron_lm_use_distributed_optimizer true`;
+                if (ta.megatron_vpp_layers)
+                    accelerateFlags += ` --megatron_lm_num_layers_per_virtual_pipeline_stage ${ta.megatron_vpp_layers}`;
+                if (ta.megatron_gradient_clipping != null)
+                    accelerateFlags += ` --megatron_lm_gradient_clipping ${ta.megatron_gradient_clipping}`;
+
             } else {
                 accelerateFlags = `--multi_gpu --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
             }
