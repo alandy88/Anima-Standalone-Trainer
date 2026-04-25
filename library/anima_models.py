@@ -1420,6 +1420,16 @@ class MiniTrainDIT(nn.Module):
                 if block_kwargs["extra_per_block_pos_emb"] is not None:
                     block_kwargs["extra_per_block_pos_emb"] = torch.nn.functional.pad(
                         block_kwargs["extra_per_block_pos_emb"], (0, 0, 0, 0, 0, _sp_h_pad))
+                # ColumnParallelLinear with SP all-gathers the sequence before the
+                # q/k/v matmuls, so RoPE sees the full padded length T*H_padded*W.
+                # Extend the RoPE table to cover the extra pad positions (zero-fill
+                # is fine — pad tokens are masked out / discarded after allgather).
+                if block_kwargs["rope_emb_L_1_1_D"] is not None:
+                    T_val = x_B_T_H_W_D.shape[1]
+                    W_val = x_B_T_H_W_D.shape[3]
+                    rope_extra = T_val * _sp_h_pad * W_val
+                    block_kwargs["rope_emb_L_1_1_D"] = torch.nn.functional.pad(
+                        block_kwargs["rope_emb_L_1_1_D"], (0, 0, 0, 0, 0, 0, 0, rope_extra))
             x_B_T_H_W_D = _split_along_dim(x_B_T_H_W_D, _sp_group, seq_dim=2)
             if block_kwargs["extra_per_block_pos_emb"] is not None:
                 block_kwargs["extra_per_block_pos_emb"] = _split_along_dim(

@@ -30,6 +30,7 @@ from typing import Union
 
 import torch
 import torch.distributed as dist
+from tqdm import tqdm
 
 from library.device_utils import init_ipex, clean_memory_on_device
 
@@ -77,7 +78,50 @@ import anima_train_network
 from anima_train_network import AnimaNetworkTrainer
 
 
-def _make_anima_lora_tp_spec(sequence_parallel: bool = False, use_llm_adapter: bool = False):
+def _ceil_to_multiple(size: int, multiple: int) -> int:
+    return ((size + multiple - 1) // multiple) * multiple
+
+
+def _infer_anima_tp_padding_geometry(dit: torch.nn.Module, tp_size: int) -> dict:
+    """Infer head-aligned padding geometry for Anima TP.
+
+    Padding is internal and always enabled for this trainer. Divisible TP degrees
+    naturally get padded_width == model_channels, so the old tp=2/4/8 behavior is
+    unchanged for the 2048/16 model.
+    """
+    model_channels = int(getattr(dit, "model_channels"))
+    num_heads = int(getattr(dit, "num_heads"))
+    if model_channels % num_heads != 0:
+        raise ValueError(
+            f"model_channels={model_channels} must be divisible by num_heads={num_heads}"
+        )
+    head_dim = model_channels // num_heads
+    padded_width = _ceil_to_multiple(model_channels, tp_size * head_dim)
+    local_width = padded_width // tp_size
+    if local_width % head_dim != 0:
+        raise ValueError(
+            f"invalid TP padding geometry: local_width={local_width} is not "
+            f"divisible by head_dim={head_dim}"
+        )
+    return {
+        "model_channels": model_channels,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "tp_size": tp_size,
+        "padded_width": padded_width,
+        "local_width": local_width,
+        "local_heads": local_width // head_dim,
+        "padding_added": padded_width - model_channels,
+    }
+
+
+def _make_anima_lora_tp_spec(
+    sequence_parallel: bool = False,
+    use_llm_adapter: bool = False,
+    *,
+    allow_padding: bool = True,
+    padding_multiple: int = 1,
+):
     """TP spec for Anima LoRA - targets UNFUSED projections.
 
     Unlike the full-finetune TP spec (which fuses q/k/v into qkv_proj),
@@ -94,8 +138,18 @@ def _make_anima_lora_tp_spec(sequence_parallel: bool = False, use_llm_adapter: b
     """
     import wd_parallel as wdp
     sp = sequence_parallel
-    col = lambda sp_flag: wdp.ColumnParallelSpec(sequence_parallel=sp_flag, seq_dim=1)
-    row = lambda sp_flag: wdp.RowParallelSpec(sequence_parallel=sp_flag, seq_dim=1)
+    col = lambda sp_flag: wdp.ColumnParallelSpec(
+        sequence_parallel=sp_flag,
+        seq_dim=1,
+        allow_padding=allow_padding,
+        padding_multiple=padding_multiple,
+    )
+    row = lambda sp_flag: wdp.RowParallelSpec(
+        sequence_parallel=sp_flag,
+        seq_dim=1,
+        allow_padding=allow_padding,
+        padding_multiple=padding_multiple,
+    )
     entries = {
         # Self-attention: individual projections (no QKV fusion)
         "blocks.*.self_attn.q_proj":       col(sp),
@@ -134,14 +188,13 @@ def _make_anima_lora_tp_spec(sequence_parallel: bool = False, use_llm_adapter: b
     return wdp.ParallelSpec(entries)
 
 
-def _fixup_attention_heads_for_tp(model: torch.nn.Module, tp_size: int) -> int:
-    """After apply_parallelism(), divide n_heads by tp_size in every Attention module.
+def _fixup_attention_heads_for_tp(model: torch.nn.Module) -> int:
+    """After apply_parallelism(), set each Attention module to its local heads.
 
     ColumnParallelLinear shards the OUTPUT dimension (features), so q/k/v proj
-    output D/tp features per rank.  The Attention.compute_qkv rearrange uses
-    h=self.n_heads hardcoded; with D/tp features and full n_heads it fails.
-    Fix: set n_heads = n_heads // tp_size so each rank treats its shard as
-    (n_heads/tp, head_dim) - mathematically equivalent to head-parallel attention.
+    output local features per rank. Each module uses its own head_dim so that
+    modules with different head sizes (e.g. main DiT vs LLM adapter) are all
+    handled correctly.
 
     Returns the number of Attention modules updated.
     """
@@ -153,10 +206,14 @@ def _fixup_attention_heads_for_tp(model: torch.nn.Module, tp_size: int) -> int:
         # Covers both main-model Attention (uses einops rearrange) and
         # LLMAdapterAttention (uses .view) - both break the same way after TP sharding.
         if isinstance(module, (Attention, LLMAdapterAttention)) and isinstance(module.q_proj, ColumnParallelLinear):
-            assert module.n_heads % tp_size == 0, (
-                f"{type(module).__name__}: n_heads={module.n_heads} not divisible by tp_size={tp_size}"
-            )
-            module.n_heads = module.n_heads // tp_size
+            local_width = int(module.q_proj.out_features)
+            mod_head_dim = int(module.head_dim)
+            if local_width % mod_head_dim != 0:
+                raise ValueError(
+                    f"{type(module).__name__}: local q_proj width={local_width} "
+                    f"is not divisible by head_dim={mod_head_dim}"
+                )
+            module.n_heads = local_width // mod_head_dim
             updated += 1
     return updated
 
@@ -255,14 +312,21 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
         if self.tp_groups is not None and self.tp_groups.tp_size > 1:
             import wd_parallel as wdp
 
+            tp_geometry = _infer_anima_tp_padding_geometry(dit, self.tp_groups.tp_size)
+
             # Apply TP sharding with unfused spec (individual q/k/v projections)
-            tp_spec = _make_anima_lora_tp_spec(self.use_sp, use_llm_adapter=getattr(dit, "use_llm_adapter", False))
+            tp_spec = _make_anima_lora_tp_spec(
+                self.use_sp,
+                use_llm_adapter=getattr(dit, "use_llm_adapter", False),
+                allow_padding=True,
+                padding_multiple=tp_geometry["head_dim"],
+            )
             dit = wdp.apply_parallelism(dit, tp_spec, self.tp_config, self.tp_groups)
             self.tp_active = True
 
             # Attention modules still use the original n_heads after sharding.
-            # Divide by tp_size so each rank computes on its n_heads//tp heads.
-            n_attn_fixed = _fixup_attention_heads_for_tp(dit, self.tp_groups.tp_size)
+            # Set each module to the padded local head count for this rank.
+            n_attn_fixed = _fixup_attention_heads_for_tp(dit)
 
             # SP scatter/gather: set the process group so MiniTrainDIT.forward
             # scatters x along H before the block loop and gathers back after.
@@ -272,12 +336,18 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             logger.info(
                 f"TP sharding applied: tp_degree={self.tp_groups.tp_size}, sp={self.use_sp}, "
                 f"llm_adapter={getattr(dit, 'use_llm_adapter', False)}, "
-                f"attention_modules_patched={n_attn_fixed}"
+                f"attention_modules_patched={n_attn_fixed}, "
+                f"model_width={tp_geometry['model_channels']}->{tp_geometry['padded_width']}, "
+                f"local_width={tp_geometry['local_width']}, local_heads={tp_geometry['local_heads']}, "
+                f"head_dim={tp_geometry['head_dim']}, padding_added={tp_geometry['padding_added']}"
             )
             self._tp_diag(
                 args,
                 f"startup backend={dist.get_backend()} tp_degree={self.tp_groups.tp_size} sp={self.use_sp} "
                 f"llm_adapter={getattr(dit, 'use_llm_adapter', False)} attention_modules_patched={n_attn_fixed} "
+                f"model_width={tp_geometry['model_channels']} padded_width={tp_geometry['padded_width']} "
+                f"local_width={tp_geometry['local_width']} local_heads={tp_geometry['local_heads']} "
+                f"head_dim={tp_geometry['head_dim']} padding_added={tp_geometry['padding_added']} "
                 f"device={accelerator.device} dtype={weight_dtype}",
                 all_ranks=True,
                 to_logger=True,
@@ -296,37 +366,27 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
     # ----- override: skip DDP wrapping for TP models -----
 
     def prepare_unet_with_accelerator(self, args, accelerator, unet):
-        """For TP: move to device without Accelerator DDP wrapping.
+        """For TP: skip Accelerator's DDP wrap and install a TP-aware grad-norm.
 
-        Three things that would break with TP + Accelerator DDP:
-          1. accelerator.prepare(unet) -> wraps frozen base model with DDP (wrong)
-          2. accelerator.prepare(network) -> wraps LoRA with DDP, broadcasts
-             rank 0's params -> destroys TP-sharded LoRA weights
-          3. accelerator.prepare(dataloader) -> distributed sampler gives each
-             rank different batches -> TP needs SAME batch on all ranks
-
-        Fix: set distributed_type=NO so Accelerator skips DDP wrapping
-        AND distributed sampling.  TP handles distribution itself; mixed
-        precision and gradient accumulation still work with NO.
-
-        This override runs BEFORE the network/dataloader prepare calls
-        (line 953 in NetworkTrainer.train), so the change takes effect.
+        Accelerator state (distributed_type=NO, num_processes=1, process_index=0)
+        is already spoofed at construction by _tp_prepare_accelerator, which
+        prevents DDP wrapping of the base model + LoRA network and prevents
+        distributed sampling on dataloaders. This method only does the two
+        things the global spoof can't:
+          1. Restore local_process_index to the real rank so tqdm progress bars
+             only print on rank 0 (the global spoof sets it to 0 everywhere so
+             is_local_main_process is True for save-hook collectives).
+          2. Monkeypatch clip_grad_norm_ to compute the global norm across TP
+             ranks (otherwise each rank clips to its local shard's norm).
         """
         if not self.tp_active:
             return super().prepare_unet_with_accelerator(args, accelerator, unet)
 
         self._tp_diag(args, "begin prepare_unet_with_accelerator", all_ranks=True, to_logger=True)
 
-        # Prevent DDP wrapping of both base model AND LoRA network.
-        # Also prevents distributed DataLoader sampler - TP needs all ranks
-        # to see the SAME batch (unlike DDP which splits batches).
-        from accelerate.utils import DistributedType
         real_rank = dist.get_rank() if dist.is_initialized() else 0
-        accelerator.state.distributed_type = DistributedType.NO
-        # process_index is already set to 0 on all ranks by the __main__
         accelerator.state.local_process_index = real_rank
-        accelerator.state.num_processes = 1  # each rank acts as single-GPU for Accelerator
-        logger.info(f"TP active - disabled Accelerator DDP (rank={real_rank}, TP handles distribution)")
+        logger.info(f"TP prepare_unet: local_process_index={real_rank} (tqdm rank-0 only)")
 
         # Monkeypatch clip_grad_norm_ to compute global norm across TP ranks.
         tp_group = self.tp_groups.tp
@@ -494,7 +554,6 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
                 mem = f" cuda_mem_alloc_mb={torch.cuda.memory_allocated() / (1024 ** 2):.1f}"
             self._tp_diag(args, f"step={self._tp_step} loss={loss_val:.8g} finite={finite_loss} latent_shape={lat_shape}{mem}", all_ranks=True)
             if self._tp_rank() == 0 and not finite_loss:
-                from tqdm import tqdm
                 tqdm.write(
                     f"[TP NaN] step {self._tp_step}: forward loss={loss_val}  "
                     f"latent_shape={lat_shape}"
@@ -527,7 +586,6 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
                     f"inf={torch.isinf(p.data).sum().item()})"
                 )
         if bad_weights:
-            from tqdm import tqdm
             tqdm.write(
                 f"[TP CHECK step {step} rank {rank}] NaN/Inf in LoRA WEIGHTS:\n"
                 + "\n".join(f"  {s}" for s in bad_weights[:10])
@@ -572,7 +630,6 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
                     if cur_max > max_abs:
                         max_abs = cur_max
 
-            from tqdm import tqdm
             grad_norm = total_sq**0.5
             tqdm.write(
                 f"[TP GRAD step {self._tp_step}] "
@@ -673,19 +730,31 @@ class AnimaNetworkTrainerTPSP(AnimaNetworkTrainer):
             for lora in network.text_encoder_loras + network.unet_loras:
                 if isinstance(lora, ColumnParallelLoRAModule) and lora._tp_group is not None:
                     w = lora.lora_up.weight.data
-                    chunk = w.shape[0] // tp_size
+                    org_module = lora.org_module_ref[0]
+                    padded_out = int(getattr(org_module, "padded_out_features", w.shape[0]))
+                    if w.shape[0] < padded_out:
+                        padded = w.new_zeros((padded_out, *w.shape[1:]))
+                        padded[:w.shape[0]] = w
+                        w = padded
+                    chunk = padded_out // tp_size
                     lora.lora_up.weight.data = w[tp_rank * chunk:(tp_rank + 1) * chunk].contiguous()
 
                 elif isinstance(lora, RowParallelLoRAModule) and lora._tp_group is not None:
                     w = lora.lora_down.weight.data
-                    chunk = w.shape[1] // tp_size
+                    org_module = lora.org_module_ref[0]
+                    padded_in = int(getattr(org_module, "padded_in_features", w.shape[1]))
+                    if w.shape[1] < padded_in:
+                        padded = w.new_zeros((w.shape[0], padded_in, *w.shape[2:]))
+                        padded[:, :w.shape[1]] = w
+                        w = padded
+                    chunk = padded_in // tp_size
                     lora.lora_down.weight.data = w[:, tp_rank * chunk:(tp_rank + 1) * chunk].contiguous()
 
         def _tp_save_weights(file, dtype, metadata):
             # Gather shards -> full weights (for save), then re-shard so training continues.
             # gather_tp_lora_weights() mutates weight.data in-place; scatter restores shards.
             try:
-                network.gather_tp_lora_weights()
+                network.gather_tp_lora_weights(trim_padding=True)
                 # Only rank 0 writes the file (all ranks have identical gathered weights)
                 if tp_rank == 0:
                     _orig_save(file, dtype, metadata)
@@ -869,7 +938,6 @@ if __name__ == "__main__":
     if getattr(args, "no_sequence_parallel", False):
         raise ValueError("--no_sequence_parallel is not supported here; this trainer intentionally runs TP+SP together")
     use_sp = True
-    args.sequence_parallel = True
 
     _ensure_wd_parallel_importable()
     import wd_parallel as wdp
@@ -906,25 +974,37 @@ if __name__ == "__main__":
     # and with process_index=0 on all ranks, leaving num_processes>1 drops ~50% of images uncached.
     _orig_prepare_accelerator = train_util.prepare_accelerator
     def _tp_prepare_accelerator(args):
+        from accelerate.state import AcceleratorState, PartialState
+        from accelerate.utils import DistributedType
         acc = _orig_prepare_accelerator(args)
         # The base trainer guards checkpoint/state/sample hooks with
         # accelerator.is_main_process. In TP/SP those hooks include collectives,
         # so every TP rank must enter them. Spoof both global and local process
-        # identity; Accelerate exposes several cached/proxied views of these.
-        acc.state.process_index = 0
-        acc.state.local_process_index = 0
-        acc.state.num_processes = 1
-        try:
-            acc.process_index = 0
-            acc.local_process_index = 0
-            acc.num_processes = 1
-        except Exception:
-            pass
+        # identity so is_main_process / is_local_main_process are True everywhere.
+        # distributed_type=NO + num_processes=1 also disable Accelerator's DDP wrap
+        # and step-count division. The prepare_data_loader passthrough guarantees
+        # TP ranks see the SAME batch (no DistributedSampler / BatchSamplerShard).
+        # Device placement is handled manually in the training loop.
+        #
+        # Why update BOTH PartialState._shared_state AND AcceleratorState._shared_state:
+        # they are SEPARATE class-level dicts. AcceleratorState.__init__ does
+        # `self.__dict__.update(PartialState._shared_state)` on every construction,
+        # so any later `AcceleratorState()` (e.g. inside AcceleratedOptimizer.__init__
+        # during accelerator.prepare(optimizer)) silently restores the un-spoofed
+        # values from PartialState. Updating PartialState first closes that hole.
+        spoof = {
+            "distributed_type": DistributedType.NO,
+            "process_index": 0,
+            "local_process_index": 0,
+            "num_processes": 1,
+        }
+        PartialState._shared_state.update(spoof)
+        AcceleratorState._shared_state.update(spoof)
+        acc.prepare_data_loader = lambda dl, **_: dl
         logger.info(
             "TP accelerator spoof: "
-            f"rank={tp_groups.tp_rank}, "
-            f"process_index={acc.process_index}, "
-            f"local_process_index={acc.local_process_index}, "
+            f"rank={tp_groups.tp_rank}/{world_size}, "
+            f"distributed_type={acc.state.distributed_type}, "
             f"num_processes={acc.num_processes}, "
             f"is_main={acc.is_main_process}, "
             f"is_local_main={acc.is_local_main_process}"
@@ -943,5 +1023,4 @@ if __name__ == "__main__":
 
     # Cleanup TP
     if tp_groups is not None:
-        import wd_parallel as wdp
         wdp.destroy_dist()

@@ -1522,6 +1522,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         const isMultiGpu = currentGpuIds && currentGpuIds.split(',').map(s => s.trim()).filter(s => s.length > 0).length > 1;
         const trainEnvVars = [
             buildEnvVar('PYTHONIOENCODING', 'utf-8'),
+            buildEnvVar('TOKENIZERS_PARALLELISM', 'false'),
             gpuEnv,
             mergedConfig.training_arguments?.step_profile ? buildEnvVar('STEP_PROFILE', '1') : '',
             mergedConfig.training_arguments?.profile_microbatch ? buildEnvVar('PROFILE_MICROBATCH', '1') : '',

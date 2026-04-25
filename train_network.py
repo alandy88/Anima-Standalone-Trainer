@@ -472,6 +472,11 @@ class NetworkTrainer:
     ) -> torch.nn.Module:
         return accelerator.prepare(unet)
 
+    def pre_step_calculation_setup(self, args, accelerator, train_dataloader):
+        """Called right before max_train_steps is computed from max_train_epochs.
+        Override to adjust accelerator.num_processes if needed (e.g. TP sets it to 1)."""
+        pass
+
     def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train: bool = True):
         pass
 
@@ -954,6 +959,7 @@ class NetworkTrainer:
             )
 
         # 学習ステップ数を計算する
+        self.pre_step_calculation_setup(args, accelerator, train_dataloader)
         if args.max_train_epochs is not None:
             args.max_train_steps = args.max_train_epochs * math.ceil(
                 len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps

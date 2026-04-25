@@ -60,6 +60,7 @@ class ColumnParallelLoRAModule(LoRAModule):
 
     def __init__(self, *args, tp_group=None, seq_dim=1, use_sp=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.org_module_ref = [self.org_module]  # save before apply_to() deletes it
         self._tp_group = tp_group
         self._seq_dim = seq_dim
         self._use_sp = use_sp
@@ -145,6 +146,7 @@ class RowParallelLoRAModule(LoRAModule):
 
     def __init__(self, *args, tp_group=None, seq_dim=1, use_sp=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.org_module_ref = [self.org_module]  # save before apply_to() deletes it
         self._tp_group = tp_group
         self._seq_dim = seq_dim
         self._use_sp = use_sp
@@ -767,12 +769,44 @@ class LoRANetwork(torch.nn.Module):
     def get_trainable_params(self):
         return self.parameters()
 
-    def gather_tp_lora_weights(self) -> None:
+    @staticmethod
+    def _pad_tensor_dim(tensor: torch.Tensor, dim: int, padded_size: int) -> torch.Tensor:
+        dim = dim % tensor.ndim
+        if tensor.size(dim) == padded_size:
+            return tensor
+        if tensor.size(dim) > padded_size:
+            raise ValueError(
+                f"cannot pad dim {dim} from {tensor.size(dim)} down to {padded_size}"
+            )
+        out_shape = list(tensor.shape)
+        out_shape[dim] = padded_size
+        out = tensor.new_zeros(out_shape)
+        index = [slice(None)] * tensor.ndim
+        index[dim] = slice(0, tensor.size(dim))
+        out[tuple(index)] = tensor
+        return out
+
+    @staticmethod
+    def _trim_tensor_dim(tensor: torch.Tensor, dim: int, original_size: int) -> torch.Tensor:
+        dim = dim % tensor.ndim
+        if tensor.size(dim) < original_size:
+            raise ValueError(
+                f"cannot trim dim {dim} of size {tensor.size(dim)} to original_size={original_size}"
+            )
+        index = [slice(None)] * tensor.ndim
+        index[dim] = slice(0, original_size)
+        return tensor[tuple(index)].contiguous()
+
+    def gather_tp_lora_weights(self, trim_padding: bool = False) -> None:
         """Gather sharded LoRA weights from all TP ranks so rank 0 holds the full LoRA.
 
         Column-parallel LoRA: lora_up is sharded on dim 0 (out_features/tp) → gather dim 0
         Row-parallel LoRA:    lora_down is sharded on dim 1 (in_features/tp) → gather dim 1
                               (lora_down.weight shape is (rank, in_features/tp))
+
+        When trim_padding=True, gathered padded shards are trimmed to the
+        original unpadded base-module shape for standard LoRA checkpoint saving.
+        scatter_tp_lora_weights() accepts either trimmed or padded full weights.
         """
         import torch.distributed as dist
 
@@ -786,7 +820,11 @@ class LoRANetwork(torch.nn.Module):
                 w_c = w.contiguous().cuda()
                 gathered = [torch.zeros_like(w_c) for _ in range(lora._tp_group.size())]
                 dist.all_gather(gathered, w_c, group=lora._tp_group)
-                lora.lora_up.weight.data = torch.cat(gathered, dim=0).to(orig_device)
+                full = torch.cat(gathered, dim=0).to(orig_device)
+                org_module = lora.org_module_ref[0]
+                if trim_padding and hasattr(org_module, "original_out_features"):
+                    full = self._trim_tensor_dim(full, 0, int(org_module.original_out_features))
+                lora.lora_up.weight.data = full
 
             elif isinstance(lora, RowParallelLoRAModule) and lora._tp_group is not None:
                 # lora_down.weight: (lora_dim, in_features/tp) → gather dim 1
@@ -795,7 +833,11 @@ class LoRANetwork(torch.nn.Module):
                 w_c = w.contiguous().cuda()
                 gathered = [torch.zeros_like(w_c) for _ in range(lora._tp_group.size())]
                 dist.all_gather(gathered, w_c, group=lora._tp_group)
-                lora.lora_down.weight.data = torch.cat(gathered, dim=1).to(orig_device)
+                full = torch.cat(gathered, dim=1).to(orig_device)
+                org_module = lora.org_module_ref[0]
+                if trim_padding and hasattr(org_module, "original_in_features"):
+                    full = self._trim_tensor_dim(full, 1, int(org_module.original_in_features))
+                lora.lora_down.weight.data = full
 
     def scatter_tp_lora_weights(self) -> None:
         """Re-shard LoRA weights back to per-rank slices after gather_tp_lora_weights().
@@ -810,14 +852,20 @@ class LoRANetwork(torch.nn.Module):
                 tp = lora._tp_group.size()
                 rank = dist.get_rank(group=lora._tp_group)
                 w = lora.lora_up.weight.data          # (D_out, lora_dim) after gather
-                chunk = w.shape[0] // tp
+                org_module = lora.org_module_ref[0]
+                padded_out = int(getattr(org_module, "padded_out_features", w.shape[0]))
+                w = self._pad_tensor_dim(w, 0, padded_out)
+                chunk = padded_out // tp
                 lora.lora_up.weight.data = w[rank * chunk:(rank + 1) * chunk].contiguous()
 
             elif isinstance(lora, RowParallelLoRAModule) and lora._tp_group is not None:
                 tp = lora._tp_group.size()
                 rank = dist.get_rank(group=lora._tp_group)
                 w = lora.lora_down.weight.data        # (lora_dim, D_in) after gather
-                chunk = w.shape[1] // tp
+                org_module = lora.org_module_ref[0]
+                padded_in = int(getattr(org_module, "padded_in_features", w.shape[1]))
+                w = self._pad_tensor_dim(w, 1, padded_in)
+                chunk = padded_in // tp
                 lora.lora_down.weight.data = w[:, rank * chunk:(rank + 1) * chunk].contiguous()
 
     def save_weights(self, file, dtype, metadata):
