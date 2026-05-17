@@ -377,9 +377,11 @@ function populateConfig(config) {
   $("cfg-max-epochs").value = t.max_train_epochs ?? 20;
   $("cfg-save-every").value = t.save_every_n_epochs ?? 1;
   $("cfg-save-last-n-epochs").value = t.save_last_n_epochs ?? 0;
+  $("cfg-keep-last-n-states-epochs").value = t.save_last_n_epochs_state ?? 1;
   $("cfg-max-steps").value = t.max_train_steps ?? 1000;
   $("cfg-save-every-steps").value = t.save_every_n_steps ?? 500;
   $("cfg-save-last-n-steps").value = t.save_last_n_steps ?? 0;
+  $("cfg-keep-last-n-states-steps").value = t.save_last_n_steps_state ?? 1;
   $("cfg-output-name").value = t.output_name || "my_anima_lora";
   $("cfg-save-format").value = t.save_model_as || "safetensors";
   $("cfg-save-precision").value = t.save_precision || "bf16";
@@ -679,6 +681,9 @@ function gatherConfig() {
       save_last_n_epochs: isEpochs
         ? (safeInt($("cfg-save-last-n-epochs").value) || undefined)
         : undefined,
+      save_last_n_epochs_state: isEpochs
+        ? safeInt($("cfg-keep-last-n-states-epochs").value, 1)
+        : undefined,
       sample_every_n_epochs:
         isEpochs && enableSampling
           ? safeInt($("cfg-sample-every").value)
@@ -691,6 +696,9 @@ function gatherConfig() {
         : undefined,
       save_last_n_steps: !isEpochs
         ? (safeInt($("cfg-save-last-n-steps").value) || undefined)
+        : undefined,
+      save_last_n_steps_state: !isEpochs
+        ? safeInt($("cfg-keep-last-n-states-steps").value, 1)
         : undefined,
       sample_every_n_steps:
         !isEpochs && enableSampling
