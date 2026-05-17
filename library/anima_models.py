@@ -839,14 +839,17 @@ class FinalLayer(nn.Module):
         x_B_T_H_W_D: torch.Tensor,
         emb_B_T_D: torch.Tensor,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+        use_fp32: bool = False,
     ):
-        if self.use_adaln_lora:
-            assert adaln_lora_B_T_3D is not None
-            shift_B_T_D, scale_B_T_D = (
-                self.adaln_modulation(emb_B_T_D) + adaln_lora_B_T_3D[:, :, : 2 * self.hidden_size]
-            ).chunk(2, dim=-1)
-        else:
-            shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
+        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers)
+        with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
+            if self.use_adaln_lora:
+                assert adaln_lora_B_T_3D is not None
+                shift_B_T_D, scale_B_T_D = (
+                    self.adaln_modulation(emb_B_T_D) + adaln_lora_B_T_3D[:, :, : 2 * self.hidden_size]
+                ).chunk(2, dim=-1)
+            else:
+                shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
 
         shift_B_T_1_1_D = rearrange(shift_B_T_D, "b t d -> b t 1 1 d")
         scale_B_T_1_1_D = rearrange(scale_B_T_D, "b t d -> b t 1 1 d")
@@ -959,29 +962,35 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        use_fp32: bool = False,
     ) -> torch.Tensor:
+        if use_fp32:
+            # Cast to float32 for better numerical stability in residual connections. Each module will cast back to float16 by enclosing autocast context.
+            x_B_T_H_W_D = x_B_T_H_W_D.float()
+
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
-        # Compute AdaLN modulation parameters
-        if self.use_adaln_lora:
-            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
-                self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
-            ).chunk(3, dim=-1)
-            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
-                self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
-            ).chunk(3, dim=-1)
-            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
-                self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
-            ).chunk(3, dim=-1)
-        else:
-            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
-                emb_B_T_D
-            ).chunk(3, dim=-1)
-            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = self.adaln_modulation_cross_attn(
-                emb_B_T_D
-            ).chunk(3, dim=-1)
-            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers)
+        with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
+            if self.use_adaln_lora:
+                shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
+                    self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
+                ).chunk(3, dim=-1)
+                shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
+                    self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
+                ).chunk(3, dim=-1)
+                shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
+                    self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
+                ).chunk(3, dim=-1)
+            else:
+                shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
+                    emb_B_T_D
+                ).chunk(3, dim=-1)
+                shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = self.adaln_modulation_cross_attn(
+                    emb_B_T_D
+                ).chunk(3, dim=-1)
+                shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
 
         # Reshape for broadcasting: (B, T, D) -> (B, T, 1, 1, D)
         shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
@@ -1042,6 +1051,7 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        use_fp32: bool = False,
     ) -> torch.Tensor:
         if self.training and self.gradient_checkpointing:
             if self.unsloth_offload_checkpointing:
@@ -1050,6 +1060,7 @@ class Block(nn.Module):
                     self._forward,
                     x_B_T_H_W_D, emb_B_T_D, crossattn_emb,
                     rope_emb_L_1_1_D, adaln_lora_B_T_3D, extra_per_block_pos_emb,
+                    use_fp32,
                 )
             elif self.cpu_offload_checkpointing:
                 # Standard cpu offload: blocking transfers
@@ -1068,6 +1079,7 @@ class Block(nn.Module):
                     create_custom_forward(self._forward),
                     x_B_T_H_W_D, emb_B_T_D, crossattn_emb,
                     rope_emb_L_1_1_D, adaln_lora_B_T_3D, extra_per_block_pos_emb,
+                    use_fp32,
                     use_reentrant=False,
                 )
             else:
@@ -1076,12 +1088,14 @@ class Block(nn.Module):
                     self._forward,
                     x_B_T_H_W_D, emb_B_T_D, crossattn_emb,
                     rope_emb_L_1_1_D, adaln_lora_B_T_3D, extra_per_block_pos_emb,
+                    use_fp32,
                     use_reentrant=False,
                 )
         else:
             return self._forward(
                 x_B_T_H_W_D, emb_B_T_D, crossattn_emb,
                 rope_emb_L_1_1_D, adaln_lora_B_T_3D, extra_per_block_pos_emb,
+                use_fp32,
             )
 
 
@@ -1438,6 +1452,9 @@ class MiniTrainDIT(nn.Module):
                     block_kwargs["extra_per_block_pos_emb"], _sp_group, seq_dim=2
                 )
 
+        # Determine whether to use float32 for block computations based on input dtype (use float32 for better stability when input is float16)
+        use_fp32 = x_B_T_H_W_D.dtype == torch.float16
+
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
@@ -1460,6 +1477,7 @@ class MiniTrainDIT(nn.Module):
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
                 crossattn_emb,
+                use_fp32=use_fp32,
                 **block_kwargs,
             )
 
@@ -1483,7 +1501,7 @@ class MiniTrainDIT(nn.Module):
             if adaln_lora_B_T_3D is not None and adaln_lora_B_T_3D.device != final_device:
                 adaln_lora_B_T_3D = adaln_lora_B_T_3D.to(final_device)
 
-        x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
+        x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D, use_fp32=use_fp32)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
         return x_B_C_Tt_Hp_Wp
 
