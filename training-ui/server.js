@@ -371,10 +371,15 @@ function buildTrainingConfig(jobName, jobPath) {
         ...trainingArgs,
         output_dir: outputDir,
         logging_dir: loggingDir,
-        save_state: true,
-        save_last_n_steps_state: 1,
-        save_last_n_epochs_state: 1
+        save_state: true
     };
+
+    // save_last_n_steps_state is in steps, but the UI field means "N checkpoints".
+    // Convert: multiply by save_every_n_steps so the trainer keeps the last N checkpoint states.
+    if (merged.training_arguments.save_last_n_steps_state && merged.training_arguments.save_every_n_steps) {
+        merged.training_arguments.save_last_n_steps_state =
+            merged.training_arguments.save_last_n_steps_state * merged.training_arguments.save_every_n_steps - 1;
+    }
 
     // Move resume from network_args to training_args
     if (jobConfig.network_arguments?.resume) {
