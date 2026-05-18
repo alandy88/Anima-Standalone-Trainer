@@ -4061,7 +4061,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--ddp_find_unused_parameters",
         action="store_true",
         default=False,
-        help="enable find_unused_parameters for DDP — required for models with >2.1B parameters to avoid int32 overflow in the gradient reducer",
+        help="enable find_unused_parameters for DDP",
     )
     parser.add_argument(
         "--ddp_bucket_cap_mb",
