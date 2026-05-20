@@ -798,18 +798,39 @@ except TypeError:
         return torch.is_autocast_enabled()
 
 
-def _run_adaln_modulation_fp32(modulation: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
-    """Run an AdaLN modulation through each submodule's forward, return fp32.
+def _is_forward_patched(module: nn.Module) -> bool:
+    """True if module.forward has been overridden on the instance or subclass.
 
-    Goes through module.forward (not F.linear with raw weights) so LoRA's
-    monkey-patched forward in networks/lora.py participates; bypassing it
-    silently drops LoRA deltas on adaln_modulation. Inner matmul still runs
-    in the module's weight dtype; only the output is promoted.
+    networks/lora.py installs LoRA via instance-level monkey-patch
+    (org_module.forward = self.forward, lands in __dict__). Subclass-style
+    LoRA replacements would override forward at the class level. Bypassing
+    either with F.linear would silently drop LoRA deltas.
+    """
+    if "forward" in module.__dict__:
+        return True
+    return type(module).forward is not nn.Linear.forward
+
+
+def _run_adaln_modulation_fp32(modulation: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
+    """Run an AdaLN modulation Sequential, returning fp32.
+
+    Hybrid: for Linears with stock forward, run F.linear with fp32 inputs and
+    weights so the matmul executes in real fp32 -- the upstream stability
+    fix's intent (its torch.autocast(dtype=fp32) is a no-op on CUDA). For
+    Linears whose forward is overridden (e.g. LoRA from networks/lora.py),
+    go through module.forward instead; the matmul stays in weight dtype and
+    we accept the overflow risk, because bypassing forward would drop the
+    LoRA delta. Forward/pre hooks on the stock-forward branch are not fired.
     """
     out = x
     for module in modulation:
         if isinstance(module, nn.Linear):
-            out = module(out.to(module.weight.dtype))
+            if _is_forward_patched(module):
+                out = module(out.to(module.weight.dtype))
+            else:
+                weight = module.weight.float()
+                bias = module.bias.float() if module.bias is not None else None
+                out = F.linear(out.float(), weight, bias)
         else:
             out = module(out)
     return out.float()
